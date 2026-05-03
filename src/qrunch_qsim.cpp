@@ -70,7 +70,7 @@ static Gate make_gate(const std::string& name,
                       const std::vector<unsigned>& q,
                       const std::vector<fp_type>& p,
                       unsigned time) {
-    static const fp_type INVSQRT2 = static_cast<fp_type>(M_SQRT2 / 2.0);
+    static const fp_type INVSQRT2 = static_cast<fp_type>(0.70710678118654752440);
 
     // Single-qubit gates
     if (name == "h")   return qsim::GateHd<fp_type>::Create(time, q[0]);

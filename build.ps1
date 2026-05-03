@@ -1,11 +1,11 @@
 # Build script for Windows (PowerShell).
-# Preferred toolchain: Ninja + clang++ (LLVM), using VS for the MSVC linker/SDK.
-# Fallback toolchain: NMake + MSVC cl.exe.
-# No Visual Studio year is hardcoded; vswhere discovers whatever is installed.
+# Uses Ninja + clang++ when Ninja is available; falls back to NMake + clang++
+# (or NMake + cl.exe if LLVM is not installed).
+# Discovers any VS installation via vswhere, including Preview/Insiders builds.
 param(
-    [string]$BuildDir = "build",
-    [switch]$ForceClang,    # always use clang++ even if MSVC fallback would work
-    [switch]$ForceMSVC      # always use cl.exe even if clang++ is available
+    [string]$BuildDir   = "build",
+    [switch]$ForceMSVC,     # skip clang++ and use cl.exe
+    [switch]$Verbose        # print what was found/not found
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,92 +28,123 @@ if (-not (Test-Path "extern/nlohmann/json.hpp")) {
 
 # ── Discover tools ─────────────────────────────────────────────────────────────
 
-# vswhere finds any VS installation, year-independent
-$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsPath  = $null
-if (Test-Path $vswhere) {
-    $vsPath = (& $vswhere -latest -property installationPath 2>$null) | Select-Object -First 1
-    if ($vsPath) { Write-Host "Found VS at: $vsPath" }
-}
-
-# Inject VS build environment (linker, Windows SDK, CRT headers) into this session.
-# This is safe to call even when using clang++ as the compiler — the MSVC linker
-# and Windows SDK are still needed for the final .dll link step.
-function Import-VSEnvironment {
-    param([string]$VsPath)
-    $vcvars = Join-Path $VsPath "VC\Auxiliary\Build\vcvarsall.bat"
-    if (-not (Test-Path $vcvars)) {
-        Write-Warning "vcvarsall.bat not found at $vcvars; skipping VS environment import"
-        return
+function Find-Exe {
+    param([string[]]$Names, [string[]]$ExtraDirs = @())
+    foreach ($name in $Names) {
+        $r = Get-Command $name -ErrorAction SilentlyContinue
+        if ($r) { return $r.Source }
     }
-    Write-Host "Importing VS build environment (x64)..."
-    $dump = cmd /c "`"$vcvars`" x64 2>&1 && set"
-    foreach ($line in $dump) {
-        if ($line -match '^([^=]+)=(.*)$') {
-            [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+    foreach ($dir in $ExtraDirs) {
+        foreach ($name in $Names) {
+            $p = Join-Path $dir "$name.exe"
+            if (Test-Path $p) { return $p }
         }
     }
+    return $null
 }
 
-# Find ninja: check PATH first, then CMake's own bin directory
-$ninjaCmd = $null
-$ninjaCandidate = Get-Command ninja -ErrorAction SilentlyContinue
-if ($ninjaCandidate) {
-    $ninjaCmd = $ninjaCandidate.Source
-} else {
-    $cmakeDir = Split-Path (Get-Command cmake -ErrorAction Stop).Source
-    $bundled  = Join-Path $cmakeDir "ninja.exe"
-    if (Test-Path $bundled) { $ninjaCmd = $bundled }
+# clang++: check PATH first, then common LLVM install locations
+$clangExe = Find-Exe "clang++" @(
+    "C:\Program Files\LLVM\bin",
+    "${env:ProgramFiles}\LLVM\bin",
+    "C:\LLVM\bin"
+)
+
+# ninja: check PATH and CMake's bundled copy
+$cmakeBin = $null
+$cmakeCmd = Get-Command cmake -ErrorAction SilentlyContinue
+if ($cmakeCmd) { $cmakeBin = Split-Path $cmakeCmd.Source }
+$ninjaExe = Find-Exe "ninja" (@("C:\Program Files\CMake\bin") + @($cmakeBin | Where-Object { $_ }))
+
+# vswhere: discovers any VS version; -prerelease includes Preview/Insiders
+$vswhere = Find-Exe "vswhere" @(
+    "C:\Program Files (x86)\Microsoft Visual Studio\Installer",
+    "C:\Program Files\Microsoft Visual Studio\Installer"
+)
+$vsPath = $null
+if ($vswhere) {
+    # -prerelease is required to find VS Preview / Community Insiders builds
+    $vsPath = (& $vswhere -latest -prerelease -property installationPath 2>$null) |
+              Where-Object { $_ } | Select-Object -First 1
 }
 
-$clangCmd = (Get-Command clang++ -ErrorAction SilentlyContinue)?.Source
-
-# ── Choose toolchain ───────────────────────────────────────────────────────────
-
-$useClang = ($clangCmd -and $ninjaCmd -and -not $ForceMSVC) -or $ForceClang
-
-if ($useClang -and -not $clangCmd) {
-    throw "clang++ not found in PATH. Install LLVM or remove -ForceClang."
-}
-if ($useClang -and -not $ninjaCmd) {
-    throw "ninja not found. Install via: winget install Ninja-build.Ninja"
+if ($Verbose) {
+    Write-Host "clang++ : $(if ($clangExe) { $clangExe } else { 'not found' })"
+    Write-Host "ninja   : $(if ($ninjaExe) { $ninjaExe } else { 'not found' })"
+    Write-Host "vswhere : $(if ($vswhere)  { $vswhere  } else { 'not found' })"
+    Write-Host "VS path : $(if ($vsPath)   { $vsPath   } else { 'not found' })"
 }
 
-# ── Build ──────────────────────────────────────────────────────────────────────
+# ── Validate we have at least one usable toolchain ────────────────────────────
 
-if ($vsPath) { Import-VSEnvironment $vsPath }
+if (-not $vsPath -and -not $clangExe) {
+    throw ("Neither a Visual Studio installation nor LLVM clang++ was found.`n" +
+           "Install one of:`n" +
+           "  Visual Studio Build Tools (any version, including Preview)`n" +
+           "  LLVM: https://github.com/llvm/llvm-project/releases")
+}
 
-if ($useClang) {
-    Write-Host "Toolchain: Ninja + clang++ ($clangCmd)"
-    cmake -B $BuildDir `
-          -G Ninja `
-          "-DCMAKE_MAKE_PROGRAM=$ninjaCmd" `
-          "-DCMAKE_CXX_COMPILER=$clangCmd" `
-          -DCMAKE_BUILD_TYPE=Release
-    cmake --build $BuildDir --parallel
-} else {
-    Write-Host "Toolchain: NMake + MSVC cl.exe"
-    if (-not $vsPath) {
-        throw ("No VS installation found and no clang++ available. " +
-               "Install Visual Studio Build Tools or LLVM.")
+# ── Import VS build environment ───────────────────────────────────────────────
+# Always do this when VS is available — clang++ on Windows still needs the
+# MSVC linker (link.exe) and Windows SDK headers for DLL creation.
+
+if ($vsPath) {
+    $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+    if (Test-Path $vcvars) {
+        Write-Host "Importing VS build environment (x64) from $vsPath ..."
+        $dump = cmd /c "`"$vcvars`" x64 2>&1 && set"
+        foreach ($line in $dump) {
+            if ($line -match '^([^=]+)=(.*)$') {
+                [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+            }
+        }
+    } else {
+        Write-Warning "vcvarsall.bat not found in $vsPath; proceeding without VS environment"
     }
-    cmake -B $BuildDir `
-          -G "NMake Makefiles" `
-          -DCMAKE_BUILD_TYPE=Release
-    cmake --build $BuildDir --parallel
 }
 
-# ── Report output path ─────────────────────────────────────────────────────────
+# ── Choose generator and compiler ─────────────────────────────────────────────
+
+$useClang = $clangExe -and -not $ForceMSVC
+
+if ($useClang -and $ninjaExe) {
+    $generator = "Ninja"
+    $compilerFlag = "-DCMAKE_CXX_COMPILER=`"$clangExe`""
+    $makeFlag = "-DCMAKE_MAKE_PROGRAM=`"$ninjaExe`""
+    Write-Host "Toolchain: Ninja + clang++ ($clangExe)"
+} elseif ($useClang) {
+    $generator = "NMake Makefiles"
+    $compilerFlag = "-DCMAKE_CXX_COMPILER=`"$clangExe`""
+    $makeFlag = $null
+    Write-Host "Toolchain: NMake + clang++ ($clangExe)"
+} else {
+    $generator = "NMake Makefiles"
+    $compilerFlag = $null
+    $makeFlag = $null
+    Write-Host "Toolchain: NMake + MSVC cl.exe"
+}
+
+# ── CMake configure + build ───────────────────────────────────────────────────
+
+$cmakeArgs = @("-B", $BuildDir, "-G", $generator, "-DCMAKE_BUILD_TYPE=Release")
+if ($compilerFlag) { $cmakeArgs += $compilerFlag }
+if ($makeFlag)     { $cmakeArgs += $makeFlag }
+
+& cmake @cmakeArgs
+if ($LASTEXITCODE -ne 0) { throw "CMake configure failed (exit $LASTEXITCODE)" }
+
+& cmake --build $BuildDir --parallel
+if ($LASTEXITCODE -ne 0) { throw "CMake build failed (exit $LASTEXITCODE)" }
+
+# ── Report ─────────────────────────────────────────────────────────────────────
 
 $dll = Get-ChildItem -Path $BuildDir -Filter "qrunch_qsim.dll" -Recurse -ErrorAction SilentlyContinue |
        Select-Object -First 1 -ExpandProperty FullName
 
-if (-not $dll) {
-    throw "Build completed but qrunch_qsim.dll was not found under $BuildDir"
-}
+if (-not $dll) { throw "Build completed but qrunch_qsim.dll was not found under $BuildDir" }
 
 Write-Host ""
 Write-Host "Built: $dll"
 Write-Host ""
-Write-Host "To use in Julia, run once per session (or add to your profile):"
+Write-Host "To activate in Julia (run once per session, or add to your profile):"
 Write-Host "  `$env:QRUNCH_QSIM_LIB = `"$dll`""

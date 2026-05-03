@@ -103,32 +103,48 @@ if ($vsPath) {
     }
 }
 
-# ── Choose generator and compiler ─────────────────────────────────────────────
+# ── Choose generator and set compiler via environment ─────────────────────────
+# We set $env:CXX instead of passing -DCMAKE_CXX_COMPILER because paths that
+# contain spaces (e.g. "C:\Program Files\LLVM\...") are mangled when embedded
+# inside a -D flag string and then PowerShell-splatted as an array element.
+# CMake reads CXX/CC env vars before any -D flags, so this is the clean path.
 
 $useClang = $clangExe -and -not $ForceMSVC
 
 if ($useClang -and $ninjaExe) {
     $generator = "Ninja"
-    $compilerFlag = "-DCMAKE_CXX_COMPILER=`"$clangExe`""
-    $makeFlag = "-DCMAKE_MAKE_PROGRAM=`"$ninjaExe`""
+    $env:CXX   = $clangExe
+    $makeFlag  = "-DCMAKE_MAKE_PROGRAM=$ninjaExe"
     Write-Host "Toolchain: Ninja + clang++ ($clangExe)"
 } elseif ($useClang) {
     $generator = "NMake Makefiles"
-    $compilerFlag = "-DCMAKE_CXX_COMPILER=`"$clangExe`""
-    $makeFlag = $null
+    $env:CXX   = $clangExe
+    $makeFlag  = $null
     Write-Host "Toolchain: NMake + clang++ ($clangExe)"
 } else {
     $generator = "NMake Makefiles"
-    $compilerFlag = $null
-    $makeFlag = $null
+    Remove-Item Env:CXX -ErrorAction SilentlyContinue   # let cmake find cl.exe
+    $makeFlag  = $null
     Write-Host "Toolchain: NMake + MSVC cl.exe"
+}
+
+# ── Stale cache check ─────────────────────────────────────────────────────────
+# Wipe the build dir when the cached generator no longer matches.
+
+$cacheFile = Join-Path $BuildDir "CMakeCache.txt"
+if (Test-Path $cacheFile) {
+    $cachedGen = (Select-String "CMAKE_GENERATOR:INTERNAL=" $cacheFile |
+                  Select-Object -First 1)?.Line -replace "^.*=",""
+    if ($cachedGen -and $cachedGen.Trim() -ne $generator) {
+        Write-Host "Removing stale build dir (cached generator '$($cachedGen.Trim())' != '$generator')"
+        Remove-Item -Recurse -Force $BuildDir
+    }
 }
 
 # ── CMake configure + build ───────────────────────────────────────────────────
 
 $cmakeArgs = @("-B", $BuildDir, "-G", $generator, "-DCMAKE_BUILD_TYPE=Release")
-if ($compilerFlag) { $cmakeArgs += $compilerFlag }
-if ($makeFlag)     { $cmakeArgs += $makeFlag }
+if ($makeFlag) { $cmakeArgs += $makeFlag }
 
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed (exit $LASTEXITCODE)" }

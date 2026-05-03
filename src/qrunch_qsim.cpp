@@ -1,25 +1,19 @@
 #define QRUNCH_QSIM_BUILD
 #include "qrunch_qsim.h"
 
-// nlohmann/json — single-header JSON library (extern/nlohmann/json.hpp)
 #include "nlohmann/json.hpp"
 
-// qsim — choose simulator implementation based on compile-time capability flags
+// qsim headers — simmux auto-selects AVX512/AVX2/SSE/basic based on
+// compile-time CPU feature flags (-mavx2 etc. set in CMakeLists.txt).
 #include "lib/circuit.h"
+#include "lib/formux.h"        // qsim::For (SequentialFor or ParallelFor)
+#include "lib/fuser_mqubit.h"  // MultiQubitGateFuser
 #include "lib/gates_qsim.h"
-#include "lib/run_qsim.h"
+#include "lib/io.h"            // qsim::IO (stderr/stdout logger)
+#include "lib/run_qsim.h"      // QSimRunner
+#include "lib/simmux.h"        // qsim::Simulator<For>
 
-#if defined(QRUNCH_QSIM_USE_AVX2)
-#  include "lib/simulator_avx.h"
-   using SimulatorImpl = qsim::SimulatorAVX<float>;
-#elif defined(QRUNCH_QSIM_USE_SSE)
-#  include "lib/simulator_sse.h"
-   using SimulatorImpl = qsim::SimulatorSSE<float>;
-#else
-#  include "lib/simulator_basic.h"
-   using SimulatorImpl = qsim::SimulatorBasic<float>;
-#endif
-
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -32,8 +26,26 @@ using json = nlohmann::json;
 using fp_type = float;
 using Gate = qsim::GateQSim<fp_type>;
 using Circuit = qsim::Circuit<Gate>;
-using StateSpace = SimulatorImpl::StateSpace;
-using State = StateSpace::State;
+
+// Silence qsim's own verbose output inside the library.
+namespace { struct SuppressQsimOutput { SuppressQsimOutput() { qsim::output::enabled = false; } } _suppress; }
+
+// ── Factory / runner types (following qsim_base.cc example) ──────────────────
+
+struct Factory {
+    explicit Factory(unsigned t) : num_threads(t) {}
+    using Simulator = qsim::Simulator<qsim::For>;
+    using StateSpace = Simulator::StateSpace;
+    StateSpace CreateStateSpace() const { return StateSpace(num_threads); }
+    Simulator  CreateSimulator()  const { return Simulator(num_threads); }
+    unsigned num_threads;
+};
+
+using Simulator  = Factory::Simulator;
+using StateSpace = Factory::StateSpace;
+using State      = StateSpace::State;
+using Fuser      = qsim::MultiQubitGateFuser<qsim::IO, Gate>;
+using Runner     = qsim::QSimRunner<qsim::IO, Fuser, Factory>;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,12 +55,23 @@ static char* heap_str(const std::string& s) {
     return p;
 }
 
+// Build a one-qubit GateMatrix1 from a 2×2 complex matrix given in row-major
+// (re, im) pairs: {re(m00), im(m00), re(m01), im(m01), re(m10), im(m10), re(m11), im(m11)}.
+static Gate matrix1(unsigned time, unsigned q,
+                    fp_type r00, fp_type i00, fp_type r01, fp_type i01,
+                    fp_type r10, fp_type i10, fp_type r11, fp_type i11) {
+    return qsim::GateMatrix1<fp_type>::Create(
+        time, q, qsim::Matrix<fp_type>{r00, i00, r01, i01, r10, i10, r11, i11});
+}
+
 // ── Gate mapping ──────────────────────────────────────────────────────────────
 
 static Gate make_gate(const std::string& name,
                       const std::vector<unsigned>& q,
                       const std::vector<fp_type>& p,
                       unsigned time) {
+    static const fp_type INVSQRT2 = static_cast<fp_type>(M_SQRT2 / 2.0);
+
     // Single-qubit gates
     if (name == "h")   return qsim::GateHd<fp_type>::Create(time, q[0]);
     if (name == "x")   return qsim::GateX<fp_type>::Create(time, q[0]);
@@ -56,36 +79,45 @@ static Gate make_gate(const std::string& name,
     if (name == "z")   return qsim::GateZ<fp_type>::Create(time, q[0]);
     if (name == "s")   return qsim::GateS<fp_type>::Create(time, q[0]);
     if (name == "t")   return qsim::GateT<fp_type>::Create(time, q[0]);
-    if (name == "sdg") return qsim::GateSdg<fp_type>::Create(time, q[0]);
-    if (name == "tdg") return qsim::GateTdg<fp_type>::Create(time, q[0]);
-    // Parameterized single-qubit gates
+    // S† = [[1,0],[0,−i]]
+    if (name == "sdg") return matrix1(time, q[0], 1,0, 0,0, 0,0, 0,-1);
+    // T† = [[1,0],[0,e^{−iπ/4}]] = [[1,0],[0, 1/√2 − i/√2]]
+    if (name == "tdg") return matrix1(time, q[0], 1,0, 0,0, 0,0, INVSQRT2,-INVSQRT2);
+    // Parameterised single-qubit gates
     if (name == "rx")  return qsim::GateRX<fp_type>::Create(time, q[0], p[0]);
     if (name == "ry")  return qsim::GateRY<fp_type>::Create(time, q[0], p[0]);
     if (name == "rz")  return qsim::GateRZ<fp_type>::Create(time, q[0], p[0]);
-    if (name == "p")   return qsim::GatePhase<fp_type>::Create(time, q[0], p[0]);
-    // Two-qubit gates
-    if (name == "cx")  return qsim::GateCNot<fp_type>::Create(time, q[0], q[1]);
+    // P(θ) = [[1,0],[0,e^{iθ}]]
+    if (name == "p") {
+        fp_type c = std::cos(p[0]), s = std::sin(p[0]);
+        return matrix1(time, q[0], 1,0, 0,0, 0,0, c,s);
+    }
+    // Two-qubit gates (qsim uses qubit[0] as the control for CNOT)
+    if (name == "cx")   return qsim::GateCNot<fp_type>::Create(time, q[0], q[1]);
     if (name == "swap") return qsim::GateSwap<fp_type>::Create(time, q[0], q[1]);
+
     throw std::runtime_error("qrunch_qsim: unsupported gate '" + name + "'");
 }
 
-// ── Core simulation ───────────────────────────────────────────────────────────
+// ── Measure op bookkeeping ────────────────────────────────────────────────────
 
 struct MeasureOp { unsigned qubit; unsigned bit; };
+
+// ── Core simulation ───────────────────────────────────────────────────────────
 
 static std::string simulate(const json& cj, const json& oj) {
     const unsigned num_qubits = cj.at("qubit_count").get<unsigned>();
     const int      num_bits   = cj.at("bit_count").get<int>();
     const int      shots      = oj.value("shots", 1024);
     const int      max_fused  = oj.value("max_fused_gate_size", 2);
-    int            num_threads = oj.value("threads", 0);
+    int            num_threads = oj.value("threads", 1);
     if (num_threads <= 0) num_threads = 1;
 
     const bool has_seed = oj.contains("seed") && !oj["seed"].is_null();
     const uint64_t seed_val = has_seed ? oj["seed"].get<uint64_t>()
-                                       : std::random_device{}();
+                                       : static_cast<uint64_t>(std::random_device{}());
 
-    // Build circuit and collect measure ops
+    // Parse circuit
     Circuit circuit;
     circuit.num_qubits = num_qubits;
     std::vector<MeasureOp> measures;
@@ -98,7 +130,7 @@ static std::string simulate(const json& cj, const json& oj) {
             auto qubits = op.at("qubits").get<std::vector<unsigned>>();
             std::vector<fp_type> params;
             if (op.contains("params"))
-                params = op["params"].get<std::vector<fp_type>>();
+                params = op.at("params").get<std::vector<fp_type>>();
             circuit.gates.push_back(make_gate(name, qubits, params, time++));
         } else if (type == "measure") {
             measures.push_back({op.at("qubit").get<unsigned>(),
@@ -106,45 +138,40 @@ static std::string simulate(const json& cj, const json& oj) {
         }
     }
 
-    // Run the unitary part once; then sample from the resulting state vector.
-    // qsim state vector qubit ordering: qubit 0 is the least-significant bit
-    // of the state index, matching Qrunch's 0-based qubit indices.
-    SimulatorImpl sim(static_cast<unsigned>(num_threads));
-    StateSpace ss(static_cast<unsigned>(num_threads));
+    // Allocate state and run the unitary circuit once.
+    // qsim's AVX state vector layout: qubit 0 is the least-significant bit of
+    // the state index, matching Qrunch's 0-based qubit numbering.
+    Factory factory(static_cast<unsigned>(num_threads));
+    StateSpace state_space = factory.CreateStateSpace();
+    State state = state_space.Create(num_qubits);
 
-    State state = ss.Create(num_qubits);
-    ss.SetStateZero(state);
+    if (state_space.IsNull(state))
+        throw std::runtime_error("qrunch_qsim: not enough memory for " +
+                                 std::to_string(num_qubits) + " qubits");
+    state_space.SetStateZero(state);
 
-    // QSimRunner::Run(param, factory, gates, state)
-    typename qsim::QSimRunner::Parameter param;
+    Runner::Parameter param;
     param.max_fused_size = static_cast<unsigned>(max_fused);
-    param.num_threads    = static_cast<unsigned>(num_threads);
+    param.seed           = static_cast<unsigned>(seed_val & 0xFFFFFFFFu);
     param.verbosity      = 0;
 
-    struct Factory {
-        explicit Factory(unsigned t) : t(t) {}
-        SimulatorImpl GetSimulator() const { return SimulatorImpl(t); }
-        unsigned t;
-    };
+    if (!Runner::Run(param, factory, circuit, state))
+        throw std::runtime_error("qrunch_qsim: simulation run failed");
 
-    if (!qsim::QSimRunner::Run(param, Factory(num_threads), circuit.gates, state))
-        throw std::runtime_error("qsim runner failed");
-
-    // Compute probability distribution over all 2^n basis states
+    // Compute probability distribution from the final state vector.
     const uint64_t state_size = uint64_t(1) << num_qubits;
     std::vector<double> probs(state_size);
     double prob_sum = 0.0;
     for (uint64_t i = 0; i < state_size; i++) {
-        auto amp = ss.GetAmplitude(state, i);
+        auto amp = StateSpace::GetAmpl(state, i);
         double p = static_cast<double>(std::norm(amp));
         probs[i] = p;
         prob_sum += p;
     }
-    // Normalise to guard against floating-point drift
     if (prob_sum > 0.0)
         for (auto& p : probs) p /= prob_sum;
 
-    // Sample shots times
+    // Sample shots times using a seeded Mersenne-Twister.
     std::mt19937_64 rng(seed_val);
     std::discrete_distribution<uint64_t> dist(probs.begin(), probs.end());
 
@@ -162,9 +189,7 @@ static std::string simulate(const json& cj, const json& oj) {
         counts[key]++;
     }
 
-    ss.Free(state);
-
-    // Serialise result
+    // Serialise result JSON
     json result;
     result["success"] = true;
     result["backend"] = "qsim";
@@ -190,8 +215,7 @@ QRUNCH_QSIM_API int qrunch_qsim_run_json(
     try {
         const auto cj = json::parse(circuit_json);
         const auto oj = json::parse(options_json);
-        const std::string result = simulate(cj, oj);
-        *result_json = heap_str(result);
+        *result_json = heap_str(simulate(cj, oj));
         return 0;
     } catch (const std::exception& e) {
         json err;
@@ -208,12 +232,8 @@ QRUNCH_QSIM_API int qrunch_qsim_run_json(
     }
 }
 
-QRUNCH_QSIM_API void qrunch_qsim_free(char* ptr) {
-    std::free(ptr);
-}
+QRUNCH_QSIM_API void qrunch_qsim_free(char* ptr) { std::free(ptr); }
 
-QRUNCH_QSIM_API const char* qrunch_qsim_version(void) {
-    return "0.1.0";
-}
+QRUNCH_QSIM_API const char* qrunch_qsim_version(void) { return "0.1.0"; }
 
 } // extern "C"

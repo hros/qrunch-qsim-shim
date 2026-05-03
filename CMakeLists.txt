@@ -37,13 +37,18 @@ target_include_directories(qrunch_qsim
 
 target_link_libraries(qrunch_qsim PRIVATE Threads::Threads)
 
-# Symbol visibility: hide everything except the explicit C ABI exports.
-if(NOT MSVC)
-    target_compile_options(qrunch_qsim PRIVATE
-        -fvisibility=hidden
-        -O3
-    )
-    # Use AVX2 when available; fall back to basic simulator otherwise.
+# Symbol visibility and SIMD flags.
+# Supports three compilers:
+#   clang++ (GNU frontend, -mavx2 flags)  — preferred, used by build.ps1
+#   clang-cl (MSVC frontend, /arch:AVX2)  — when MSVC=TRUE and Clang ID
+#   cl.exe (MSVC)                          — NMake fallback
+if(MSVC)
+    # cl.exe or clang-cl: use MSVC-style flags
+    target_compile_options(qrunch_qsim PRIVATE /O2 /arch:AVX2)
+    target_compile_definitions(qrunch_qsim PRIVATE QRUNCH_QSIM_USE_AVX2)
+else()
+    # clang++ or GCC: use GCC-style flags
+    target_compile_options(qrunch_qsim PRIVATE -fvisibility=hidden -O3)
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("-mavx2" COMPILER_HAS_AVX2)
     if(COMPILER_HAS_AVX2)
@@ -56,10 +61,6 @@ if(NOT MSVC)
             target_compile_definitions(qrunch_qsim PRIVATE QRUNCH_QSIM_USE_SSE)
         endif()
     endif()
-else()
-    target_compile_options(qrunch_qsim PRIVATE /O2)
-    target_compile_definitions(qrunch_qsim PRIVATE QRUNCH_QSIM_USE_AVX2)
-    target_compile_options(qrunch_qsim PRIVATE /arch:AVX2)
 endif()
 
 # ── Install ────────────────────────────────────────────────────────────────────

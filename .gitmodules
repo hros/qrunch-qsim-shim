@@ -1,0 +1,4 @@
+[submodule "extern/qsim"]
+	path = extern/qsim
+	url = https://github.com/quantumlib/qsim.git
+	shallow = true

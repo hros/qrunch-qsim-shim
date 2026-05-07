@@ -117,9 +117,12 @@ static std::string simulate(const json& cj, const json& oj) {
     const uint64_t seed_val = has_seed ? oj["seed"].get<uint64_t>()
                                        : static_cast<uint64_t>(std::random_device{}());
 
-    // Parse circuit
-    Circuit circuit;
-    circuit.num_qubits = num_qubits;
+    // Parse circuit into segments split at reset boundaries.
+    // Mid-circuit reset is non-unitary — we run the circuit in segments,
+    // measure + collapse + conditional-X at each reset boundary.
+    std::vector<std::vector<Gate>> segments;
+    std::vector<unsigned> reset_qubits;
+    std::vector<Gate> current_gates;
     std::vector<MeasureOp> measures;
     unsigned time = 0;
 
@@ -127,18 +130,26 @@ static std::string simulate(const json& cj, const json& oj) {
         const std::string type = op.at("type").get<std::string>();
         if (type == "gate") {
             const std::string name = op.at("name").get<std::string>();
-            auto qubits = op.at("qubits").get<std::vector<unsigned>>();
-            std::vector<fp_type> params;
-            if (op.contains("params"))
-                params = op.at("params").get<std::vector<fp_type>>();
-            circuit.gates.push_back(make_gate(name, qubits, params, time++));
+            if (name == "reset") {
+                auto qubits = op.at("qubits").get<std::vector<unsigned>>();
+                segments.push_back(current_gates);
+                reset_qubits.push_back(qubits[0]);
+                current_gates.clear();
+            } else {
+                auto qubits = op.at("qubits").get<std::vector<unsigned>>();
+                std::vector<fp_type> params;
+                if (op.contains("params"))
+                    params = op.at("params").get<std::vector<fp_type>>();
+                current_gates.push_back(make_gate(name, qubits, params, time++));
+            }
         } else if (type == "measure") {
             measures.push_back({op.at("qubit").get<unsigned>(),
                                 op.at("bit").get<unsigned>()});
         }
     }
+    segments.push_back(current_gates);  // final segment (no reset after)
 
-    // Allocate state and run the unitary circuit once.
+    // Allocate state and run each segment, handling resets between them.
     // qsim's AVX state vector layout: qubit 0 is the least-significant bit of
     // the state index, matching Qrunch's 0-based qubit numbering.
     Factory factory(static_cast<unsigned>(num_threads));
@@ -155,8 +166,33 @@ static std::string simulate(const json& cj, const json& oj) {
     param.seed           = static_cast<unsigned>(seed_val & 0xFFFFFFFFu);
     param.verbosity      = 0;
 
-    if (!Runner::Run(param, factory, circuit, state))
-        throw std::runtime_error("qrunch_qsim: simulation run failed");
+    // Create the sampling RNG early — it is also used for reset measurements
+    // so the entire run (resets + final sampling) is seed-deterministic.
+    std::mt19937_64 rng(seed_val);
+
+    for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
+        if (!segments[seg_idx].empty()) {
+            Circuit seg_circuit;
+            seg_circuit.num_qubits = num_qubits;
+            seg_circuit.gates = segments[seg_idx];
+            if (!Runner::Run(param, factory, seg_circuit, state))
+                throw std::runtime_error("qrunch_qsim: segment run failed");
+        }
+
+        // Handle mid-circuit reset after this segment.
+        if (seg_idx < reset_qubits.size()) {
+            unsigned q = reset_qubits[seg_idx];
+            std::vector<unsigned> qvec = {q};
+            auto result = state_space.Measure(qvec, rng, state);
+            if (result.valid && !result.bitstring.empty() && result.bitstring[0] == 1) {
+                Circuit x_circuit;
+                x_circuit.num_qubits = num_qubits;
+                x_circuit.gates.push_back(qsim::GateX<fp_type>::Create(time++, q));
+                if (!Runner::Run(param, factory, x_circuit, state))
+                    throw std::runtime_error("qrunch_qsim: reset X gate failed");
+            }
+        }
+    }
 
     // Compute probability distribution from the final state vector.
     const uint64_t state_size = uint64_t(1) << num_qubits;
@@ -171,8 +207,7 @@ static std::string simulate(const json& cj, const json& oj) {
     if (prob_sum > 0.0)
         for (auto& p : probs) p /= prob_sum;
 
-    // Sample shots times using a seeded Mersenne-Twister.
-    std::mt19937_64 rng(seed_val);
+    // Sample shots times using the already-seeded Mersenne-Twister.
     std::discrete_distribution<uint64_t> dist(probs.begin(), probs.end());
 
     std::map<std::vector<int>, int> counts;

@@ -175,26 +175,31 @@ static std::string simulate(const json& cj, const json& oj) {
     std::mt19937_64 rng(seed_val);
     std::discrete_distribution<uint64_t> dist(probs.begin(), probs.end());
 
-    std::map<std::string, int> counts;
+    std::map<std::vector<int>, int> counts;
     std::vector<int> bit_outcomes(static_cast<size_t>(num_bits), 0);
 
     for (int s = 0; s < shots; s++) {
         const uint64_t idx = dist(rng);
         for (const auto& m : measures)
             bit_outcomes[m.bit] = static_cast<int>((idx >> m.qubit) & 1u);
-        std::string key;
-        key.reserve(static_cast<size_t>(num_bits));
-        for (int b = 0; b < num_bits; b++)
-            key += static_cast<char>('0' + bit_outcomes[b]);
-        counts[key]++;
+        counts[bit_outcomes]++;
     }
 
-    // Serialise result JSON
+    // Serialise result JSON with structured measurement data.
     json result;
     result["success"] = true;
     result["backend"] = "qsim";
     result["shots"]   = shots;
-    result["counts"]  = counts;
+    result["bit_count"] = num_bits;
+
+    json results_array = json::array();
+    for (const auto& [bits, count] : counts) {
+        json entry;
+        entry["bits"] = bits;
+        entry["count"] = count;
+        results_array.push_back(entry);
+    }
+    result["results"] = results_array;
     result["metadata"]["nqubits"] = num_qubits;
     result["metadata"]["threads"] = num_threads;
     return result.dump();

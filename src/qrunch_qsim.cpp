@@ -274,6 +274,10 @@ QRUNCH_QSIM_API int qrunch_qsim_run_json(
 
 QRUNCH_QSIM_API void qrunch_qsim_free(char* ptr) { std::free(ptr); }
 
-QRUNCH_QSIM_API const char* qrunch_qsim_version(void) { return "0.1.0"; }
+QRUNCH_QSIM_API int qrunch_qsim_version(void) { return 1; }
+
+QRUNCH_QSIM_API int qrunch_qsim_capabilities(void) {
+    return QRUNCH_QSIM_CAP_UNITARY | QRUNCH_QSIM_CAP_RESET;
+}
 
 } // extern "C"

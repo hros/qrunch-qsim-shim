@@ -32,7 +32,8 @@ extern "C" {
  *
  * result_json   — on success: caller must free with qrunch_qsim_free().
  *   {"success":true,"backend":"qsim","shots":N,
- *    "counts":{"00":N0,"11":N1,...},
+ *    "results":[{"bits":[0,1],"count":50},...],
+ *    "bit_count":N,
  *    "metadata":{"nqubits":N,"threads":N,"simd":"avx"}}
  *
  * error_json    — on failure: caller must free with qrunch_qsim_free().
@@ -50,8 +51,26 @@ QRUNCH_QSIM_API int qrunch_qsim_run_json(
 /* Free a buffer returned by qrunch_qsim_run_json. */
 QRUNCH_QSIM_API void qrunch_qsim_free(char* ptr);
 
-/* Null-terminated version string, e.g. "0.1.0". Never free this pointer. */
-QRUNCH_QSIM_API const char* qrunch_qsim_version(void);
+/*
+ * Capability bitmask constants for qrunch_qsim_capabilities().
+ * Consumers bitwise-AND the return value against these flags.
+ */
+#define QRUNCH_QSIM_CAP_UNITARY       (1 << 0)  /* standard unitary gates        */
+#define QRUNCH_QSIM_CAP_RESET         (1 << 1)  /* mid-circuit reset              */
+#define QRUNCH_QSIM_CAP_GPU_CUQUANTUM (1 << 2)  /* reserved: GPU / cuQuantum      */
+
+/*
+ * Return the C ABI version of the shim as a simple integer.
+ * Increment this whenever the ABI surface changes incompatibly.
+ * Current version: 1.
+ */
+QRUNCH_QSIM_API int qrunch_qsim_version(void);
+
+/*
+ * Return a bitmask of supported features (see QRUNCH_QSIM_CAP_* above).
+ * Callers can test specific features with (caps & QRUNCH_QSIM_CAP_UNITARY) etc.
+ */
+QRUNCH_QSIM_API int qrunch_qsim_capabilities(void);
 
 #ifdef __cplusplus
 }

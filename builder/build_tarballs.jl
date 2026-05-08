@@ -54,7 +54,7 @@ version = v"0.2.0"   # First JLL-compatible version (C ABI v1)
 sources = [
     ArchiveSource(
         "https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz",
-        "d5a8e7c8d9b6a5c4e3d2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d"),
+        "0000000000000000000000000000000000000000000000000000000000000000"),
     DirectorySource("./bundled"),   # shim/qsim tree (populated before calling build_tarballs)
 ]
 

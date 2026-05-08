@@ -55,7 +55,7 @@ sources = [
     ArchiveSource(
         "https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz",
         "d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d"),
-    DirectorySource("./bundled"),   # shim/qsim tree (populated before calling build_tarballs)
+    DirectorySource(".."),   # shim/qsim tree (parent of builder/)
 ]
 
 # ── Build script ───────────────────────────────────────────────────────────────
@@ -69,12 +69,12 @@ if [[ -z "${JSON_DIR}" ]]; then
     JSON_DIR=$(ls -d ${workspace}/srcdir/json-* 2>/dev/null | head -1)
 fi
 if [[ -n "${JSON_DIR}" ]]; then
-    mkdir -p ${srcdir}/shim/qsim/extern/nlohmann
-    cp ${JSON_DIR}/single_include/nlohmann/json.hpp ${srcdir}/shim/qsim/extern/nlohmann/
+    mkdir -p ${srcdir}/extern/nlohmann
+    cp ${JSON_DIR}/single_include/nlohmann/json.hpp ${srcdir}/extern/nlohmann/
 else
     # Fallback: try to download directly
-    mkdir -p ${srcdir}/shim/qsim/extern/nlohmann
-    curl -sL -o ${srcdir}/shim/qsim/extern/nlohmann/json.hpp \
+    mkdir -p ${srcdir}/extern/nlohmann
+    curl -sL -o ${srcdir}/extern/nlohmann/json.hpp \
         https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
 fi
 
@@ -91,7 +91,7 @@ fi
 echo "=== qrunch_qsim build: target=${target}, QSIM_SIMD=${QSIM_SIMD} ==="
 
 # ── Stage 3: CMake configure & build ───────────────────────────────────────
-cd ${srcdir}/shim/qsim
+cd ${srcdir}
 mkdir -p build && cd build
 
 cmake .. \
